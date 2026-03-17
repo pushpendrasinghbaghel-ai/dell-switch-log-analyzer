@@ -3,13 +3,23 @@
 Dell Switch Log Analyzer for Dynatrace
 =======================================
 Generic tool to ingest Dell switch syslog files into Dynatrace and
-auto-generate a Gen 3 STP analysis dashboard.
+auto-generate a Gen 3 comprehensive analysis dashboard.
 
 Supports:
   - Dell N-Series (N3048ET, N3048ET-ON, etc.) - BSD syslog format
   - Dell OS10 (S4128T-ON, S5248F-ON, etc.) - RFC5424 syslog format
   - Auto-discovers switch IPs, hostnames, and models from log content
   - Auto-detects ingestion timeframe for dashboard queries
+
+Analysis Covers:
+  - STP: root bridge changes, topology changes, port state transitions, BPDU
+  - Interface: link up/down, flapping, admin state changes
+  - Auth/Access: user logins, session events, password changes
+  - Performance: CPU utilization alarms, process utilization
+  - LACP/LAG: port grouped/ungrouped, link aggregation changes
+  - VLT: peer up/down, role elections, port-channel state
+  - Hardware: fan/PSU/unit detection, SFP changes, faults
+  - System: restarts, disk space, mode changes, MAC moves
 
 Usage:
   # Set environment variables:
@@ -97,6 +107,47 @@ STP_KEYWORDS = re.compile(
     r'root.bridge|root.change|STP_ROOT|STP_COMPAT|port.state|MSTP',
     re.IGNORECASE
 )
+
+# Event category classification for OS10 event codes
+EVENT_CATEGORIES = {
+    # STP
+    'STP_ROOT_CHANGE': 'stp', 'STP_COMPATIBILITY_MODE': 'stp',
+    # Interface
+    'IFM_OSTATE_UP': 'interface', 'IFM_OSTATE_DN': 'interface',
+    'IFM_ASTATE_UP': 'interface', 'IFM_ASTATE_DN': 'interface',
+    # Auth
+    'ALM_AUTH_EVENT': 'auth', 'PASSWORD_CHANGE': 'auth',
+    # Performance/CPU
+    'PM_SYS_UTIL_HI': 'performance', 'PM_SYS_UTIL_LO': 'performance',
+    'PM_PROC_UTIL_HI': 'performance', 'PM_PROC_UTIL_LO': 'performance',
+    # LACP
+    'LACP_PORT_GROUPED': 'lacp', 'LACP_PORT_UNGROUPED': 'lacp',
+    # VLT
+    'VLT_PORT_CHANNEL_UP': 'vlt', 'VLT_PORT_CHANNEL_DOWN': 'vlt',
+    'VLT_PEER_UP': 'vlt', 'VLT_PEER_DOWN': 'vlt',
+    'VLT_ELECTION_ROLE': 'vlt', 'VLT_DELAY_RESTORE_START': 'vlt',
+    'VLT_DELAY_RESTORE_COMPLETE': 'vlt',
+    # Hardware
+    'EQM_FAN_TRAY_DETECTED': 'hardware', 'EQM_PSU_DETECTED': 'hardware',
+    'EQM_MORE_PSU_FAULT': 'hardware', 'EQM_UNIT_DETECTED': 'hardware',
+    'EQM_UNIT_CHECKIN': 'hardware', 'EQM_UNIT_UP': 'hardware',
+    'EQM_MEDIA_PRESENT': 'hardware', 'EQM_MEDIA_NOT_PRESENT': 'hardware',
+    # System
+    'SYS_STAT_LOW_DISK_SPACE': 'system', 'SYSTEM_MODE_CHNG': 'system',
+    'ALM_SYSTEM_RESTART': 'system', 'NDM_SYSTEM_RELOAD': 'system',
+    'INFRA_AFS': 'system', 'CMS_INIT_STATE': 'system',
+    'SUPPORT_BUNDLE_STARTED': 'system', 'SUPPORT_BUNDLE_COMPLETED': 'system',
+    'SOSREPORT_GEN_STARTED': 'system',
+}
+
+# BSD syslog process-to-category mapping
+BSD_PROCESS_CATEGORIES = {
+    'TRAPMGR': None,  # classified by message content
+    'FDB': 'system',  # MAC moves
+    'CLI_WEB': 'auth',
+    'DOT3AD': 'lacp',
+    'OpEN': 'system',  # SupportAssist
+}
 
 # N-Series BSD syslog: <priority>Mon DD HH:MM:SS hostname process[task]: file(line) seq %% LEVEL msg
 BSD_SYSLOG = re.compile(
@@ -243,6 +294,66 @@ def classify_stp_event(message):
     return None
 
 
+def classify_event_category(entry):
+    """Classify an entry into an event category and sub-type. Returns (category, event_code)."""
+    msg = entry.get("message", "")
+
+    if entry.get("format") == "rfc5424":
+        # OS10: use %EVENT_CODE from message
+        ev_match = re.search(r'%([A-Z][A-Z0-9_]+):', msg)
+        if ev_match:
+            event_code = ev_match.group(1)
+            category = EVENT_CATEGORIES.get(event_code)
+            if not category:
+                # Infer from prefix
+                prefix = event_code.split('_')[0]
+                prefix_map = {
+                    'STP': 'stp', 'IFM': 'interface', 'ALM': 'auth',
+                    'PM': 'performance', 'LACP': 'lacp', 'VLT': 'vlt',
+                    'EQM': 'hardware', 'SYS': 'system', 'PIM': 'system',
+                    'IP': 'system', 'ISCSI': 'system', 'NDM': 'system',
+                    'UDS': 'system', 'CMS': 'system', 'INFRA': 'system',
+                }
+                category = prefix_map.get(prefix, 'other')
+            return category, event_code
+    else:
+        # N-series BSD: classify by process + message content
+        proc = entry.get("process", "")
+        msg_lower = msg.lower()
+
+        # STP events
+        if STP_KEYWORDS.search(msg):
+            return 'stp', classify_stp_event(msg) or 'STP_OTHER'
+
+        # MAC moves (FDB)
+        if 'MAC_MOVE' in msg:
+            return 'system', 'FDB_MAC_MOVE'
+
+        # Link events
+        if 'Link Up' in msg:
+            return 'interface', 'LINK_UP'
+        if 'Link Down' in msg:
+            return 'interface', 'LINK_DOWN'
+
+        # Auth
+        if proc == 'CLI_WEB' or 'logged in' in msg or 'Session' in msg_lower or 'password' in msg_lower:
+            return 'auth', 'AUTH_LOGIN'
+
+        # LACP
+        if proc == 'DOT3AD' or 'attached to' in msg:
+            return 'lacp', 'LACP_PORT_ATTACH'
+
+        # SupportAssist
+        if 'SUPPORT-ASSIST' in msg:
+            return 'system', 'SUPPORT_ASSIST_ERROR'
+
+        cat = BSD_PROCESS_CATEGORIES.get(proc, 'other')
+        if cat:
+            return cat, f'{proc}_EVENT'
+
+    return 'other', 'UNKNOWN'
+
+
 def extract_vlan_id(message):
     m = re.search(r'VLAN\s*(?:ID:?\s*)?(\d+)', message, re.IGNORECASE)
     if m:
@@ -317,13 +428,20 @@ def parse_log_file(filepath):
                         entry["switch_hostname"] = entry.get("hostname", "")
                         entry["source_file"] = filename
 
-                        is_stp = bool(STP_KEYWORDS.search(entry["message"]))
+                        # Classify event category
+                        category, event_code = classify_event_category(entry)
+                        entry["event_category"] = category
+                        entry["event_code"] = event_code
+
+                        is_stp = (category == 'stp') or bool(STP_KEYWORDS.search(entry["message"]))
                         entry["is_stp_related"] = is_stp
                         if is_stp:
-                            entry["stp_event_type"] = classify_stp_event(entry["message"])
-                            entry["vlan_id"] = extract_vlan_id(entry["message"])
-                            entry["interface"] = extract_interface(entry["message"])
-                            entry["mac_address"] = extract_mac_address(entry["message"])
+                            entry["stp_event_type"] = classify_stp_event(entry["message"]) or event_code
+
+                        # Extract enrichment from all events (not just STP)
+                        entry["vlan_id"] = extract_vlan_id(entry["message"])
+                        entry["interface"] = extract_interface(entry["message"])
+                        entry["mac_address"] = extract_mac_address(entry["message"])
 
                         entries.append(entry)
                 buffer = line
@@ -338,13 +456,16 @@ def parse_log_file(filepath):
                 entry["switch_model"] = discovered_model or "Dell-Switch"
                 entry["switch_hostname"] = entry.get("hostname", "")
                 entry["source_file"] = filename
-                is_stp = bool(STP_KEYWORDS.search(entry["message"]))
+                category, event_code = classify_event_category(entry)
+                entry["event_category"] = category
+                entry["event_code"] = event_code
+                is_stp = (category == 'stp') or bool(STP_KEYWORDS.search(entry["message"]))
                 entry["is_stp_related"] = is_stp
                 if is_stp:
-                    entry["stp_event_type"] = classify_stp_event(entry["message"])
-                    entry["vlan_id"] = extract_vlan_id(entry["message"])
-                    entry["interface"] = extract_interface(entry["message"])
-                    entry["mac_address"] = extract_mac_address(entry["message"])
+                    entry["stp_event_type"] = classify_stp_event(entry["message"]) or event_code
+                entry["vlan_id"] = extract_vlan_id(entry["message"])
+                entry["interface"] = extract_interface(entry["message"])
+                entry["mac_address"] = extract_mac_address(entry["message"])
                 entries.append(entry)
 
     return entries
@@ -396,6 +517,8 @@ def convert_to_dynatrace_format(entry):
         "switch.model": entry.get("switch_model", ""),
         "switch.hostname": entry.get("switch_hostname", ""),
         "stp.related": str(entry.get("is_stp_related", False)).lower(),
+        "event.category": entry.get("event_category", "other"),
+        "event.code": entry.get("event_code", "UNKNOWN"),
     }
 
     if entry.get("timestamp"):
@@ -409,11 +532,11 @@ def convert_to_dynatrace_format(entry):
     if entry.get("stp_event_type"):
         dt_entry["stp.event.type"] = entry["stp_event_type"]
     if entry.get("vlan_id"):
-        dt_entry["stp.vlan.id"] = entry["vlan_id"]
+        dt_entry["vlan.id"] = entry["vlan_id"]
     if entry.get("interface"):
-        dt_entry["stp.interface"] = entry["interface"]
+        dt_entry["interface.name"] = entry["interface"]
     if entry.get("mac_address"):
-        dt_entry["stp.mac.address"] = entry["mac_address"]
+        dt_entry["mac.address"] = entry["mac_address"]
 
     return dt_entry
 
@@ -485,29 +608,69 @@ def analyze_entries(all_entries):
         t = e.get("stp_event_type", "UNKNOWN")
         stp_types[t] = stp_types.get(t, 0) + 1
 
-    # VLANs
+    # VLANs (from all entries, not just STP)
     vlans = {}
-    for e in stp_entries:
+    for e in all_entries:
         v = e.get("vlan_id")
         if v:
             vlans[v] = vlans.get(v, 0) + 1
 
-    # Interfaces
+    # Interfaces (from all entries)
     interfaces = {}
-    for e in stp_entries:
+    for e in all_entries:
         iface = e.get("interface")
         if iface:
             interfaces[iface] = interfaces.get(iface, 0) + 1
 
-    # MAC addresses
+    # MAC addresses (from all entries)
     macs = {}
-    for e in stp_entries:
+    for e in all_entries:
         mac = e.get("mac_address")
         if mac:
             macs[mac] = macs.get(mac, 0) + 1
 
     # Root bridge changes
     root_changes = sum(1 for e in stp_entries if e.get("stp_event_type") == "STP_ROOT_BRIDGE_CHANGE")
+
+    # Event categories breakdown
+    categories = {}
+    event_codes = {}
+    for e in all_entries:
+        cat = e.get("event_category", "other")
+        code = e.get("event_code", "UNKNOWN")
+        categories[cat] = categories.get(cat, 0) + 1
+        event_codes[code] = event_codes.get(code, 0) + 1
+
+    # Interface-specific stats
+    iface_up = sum(1 for e in all_entries if e.get("event_code") in ("IFM_OSTATE_UP", "LINK_UP"))
+    iface_down = sum(1 for e in all_entries if e.get("event_code") in ("IFM_OSTATE_DN", "LINK_DOWN"))
+    iface_admin_up = sum(1 for e in all_entries if e.get("event_code") == "IFM_ASTATE_UP")
+    iface_admin_down = sum(1 for e in all_entries if e.get("event_code") == "IFM_ASTATE_DN")
+
+    # CPU/Performance
+    cpu_high = sum(1 for e in all_entries if e.get("event_code") == "PM_SYS_UTIL_HI")
+    cpu_low = sum(1 for e in all_entries if e.get("event_code") == "PM_SYS_UTIL_LO")
+
+    # LACP
+    lacp_grouped = sum(1 for e in all_entries if e.get("event_code") == "LACP_PORT_GROUPED")
+    lacp_ungrouped = sum(1 for e in all_entries if e.get("event_code") == "LACP_PORT_UNGROUPED")
+
+    # VLT
+    vlt_peer_up = sum(1 for e in all_entries if e.get("event_code") == "VLT_PEER_UP")
+    vlt_peer_down = sum(1 for e in all_entries if e.get("event_code") == "VLT_PEER_DOWN")
+    vlt_channel_up = sum(1 for e in all_entries if e.get("event_code") == "VLT_PORT_CHANNEL_UP")
+    vlt_channel_down = sum(1 for e in all_entries if e.get("event_code") == "VLT_PORT_CHANNEL_DOWN")
+
+    # Hardware
+    psu_faults = sum(1 for e in all_entries if e.get("event_code") == "EQM_MORE_PSU_FAULT")
+
+    # System
+    restarts = sum(1 for e in all_entries if e.get("event_code") in ("ALM_SYSTEM_RESTART", "NDM_SYSTEM_RELOAD"))
+    disk_warnings = sum(1 for e in all_entries if e.get("event_code") == "SYS_STAT_LOW_DISK_SPACE")
+    mac_moves = sum(1 for e in all_entries if e.get("event_code") == "FDB_MAC_MOVE")
+
+    # Auth
+    auth_events = categories.get("auth", 0)
 
     summary = {
         "total_logs": total,
@@ -516,17 +679,34 @@ def analyze_entries(all_entries):
         "switches": switches,
         "stp_types": dict(sorted(stp_types.items(), key=lambda x: -x[1])),
         "top_vlans": dict(sorted(vlans.items(), key=lambda x: -x[1])[:15]),
-        "top_interfaces": dict(sorted(interfaces.items(), key=lambda x: -x[1])[:10]),
+        "top_interfaces": dict(sorted(interfaces.items(), key=lambda x: -x[1])[:15]),
         "top_macs": dict(sorted(macs.items(), key=lambda x: -x[1])[:10]),
         "root_bridge_changes": root_changes,
         "num_vlans_affected": len(vlans),
+        # New: category breakdown
+        "categories": dict(sorted(categories.items(), key=lambda x: -x[1])),
+        "top_event_codes": dict(sorted(event_codes.items(), key=lambda x: -x[1])[:25]),
+        # Interface
+        "iface_up": iface_up, "iface_down": iface_down,
+        "iface_admin_up": iface_admin_up, "iface_admin_down": iface_admin_down,
+        # CPU
+        "cpu_high": cpu_high, "cpu_low": cpu_low,
+        # LACP
+        "lacp_grouped": lacp_grouped, "lacp_ungrouped": lacp_ungrouped,
+        # VLT
+        "vlt_peer_up": vlt_peer_up, "vlt_peer_down": vlt_peer_down,
+        "vlt_channel_up": vlt_channel_up, "vlt_channel_down": vlt_channel_down,
+        # Hardware / System
+        "psu_faults": psu_faults, "restarts": restarts,
+        "disk_warnings": disk_warnings, "mac_moves": mac_moves,
+        "auth_events": auth_events,
     }
     return summary
 
 
 def print_summary(summary):
     print(f"\n{'=' * 70}")
-    print("DELL SWITCH LOG ANALYSIS - STP FOCUS")
+    print("DELL SWITCH LOG ANALYSIS - COMPREHENSIVE")
     print(f"{'=' * 70}")
     print(f"Total logs: {summary['total_logs']:,}")
     print(f"STP events: {summary['stp_count']:,} ({summary['stp_pct']:.1f}%)")
@@ -535,24 +715,55 @@ def print_summary(summary):
     for ip, info in summary["switches"].items():
         print(f"  {ip} ({info['model']}, {info['hostname']}): {info['total']:,} total, {info['stp']:,} STP")
 
+    print("\n--- Event Categories ---")
+    for cat, cnt in summary["categories"].items():
+        pct = cnt / summary["total_logs"] * 100 if summary["total_logs"] else 0
+        print(f"  {cat}: {cnt:,} ({pct:.1f}%)")
+
     print("\n--- STP Event Types ---")
     for t, c in summary["stp_types"].items():
         print(f"  {t}: {c:,}")
 
+    if summary["iface_up"] or summary["iface_down"]:
+        print(f"\n--- Interface Health ---")
+        print(f"  Link Up: {summary['iface_up']:,}  |  Link Down: {summary['iface_down']:,}")
+        print(f"  Admin Up: {summary['iface_admin_up']:,}  |  Admin Down: {summary['iface_admin_down']:,}")
+
+    if summary["cpu_high"]:
+        print(f"\n--- CPU Utilization ---")
+        print(f"  High alarms: {summary['cpu_high']:,}  |  Cleared: {summary['cpu_low']:,}")
+
+    if summary["lacp_grouped"] or summary["lacp_ungrouped"]:
+        print(f"\n--- LACP / Link Aggregation ---")
+        print(f"  Grouped: {summary['lacp_grouped']:,}  |  Ungrouped: {summary['lacp_ungrouped']:,}")
+
+    if summary["vlt_peer_up"] or summary["vlt_peer_down"]:
+        print(f"\n--- VLT (Virtual Link Trunking) ---")
+        print(f"  Peer Up: {summary['vlt_peer_up']:,}  |  Peer Down: {summary['vlt_peer_down']:,}")
+        print(f"  Channel Up: {summary['vlt_channel_up']:,}  |  Channel Down: {summary['vlt_channel_down']:,}")
+
+    if summary["psu_faults"] or summary["restarts"] or summary["disk_warnings"]:
+        print(f"\n--- System / Hardware ---")
+        if summary["psu_faults"]: print(f"  [ALERT] PSU Faults: {summary['psu_faults']:,}")
+        if summary["restarts"]: print(f"  [ALERT] System Restarts: {summary['restarts']:,}")
+        if summary["disk_warnings"]: print(f"  [WARN]  Low Disk Space Warnings: {summary['disk_warnings']:,}")
+
+    if summary["mac_moves"]:
+        print(f"  MAC Moves (potential loops): {summary['mac_moves']:,}")
+
+    if summary["auth_events"]:
+        print(f"\n--- Authentication ---")
+        print(f"  Auth events: {summary['auth_events']:,}")
+
     if summary["top_vlans"]:
         print("\n--- Top Affected VLANs ---")
-        for v, c in summary["top_vlans"].items():
+        for v, c in list(summary["top_vlans"].items())[:10]:
             print(f"  VLAN {v}: {c:,}")
 
     if summary["top_interfaces"]:
         print("\n--- Top Affected Interfaces ---")
-        for iface, c in summary["top_interfaces"].items():
+        for iface, c in list(summary["top_interfaces"].items())[:10]:
             print(f"  {iface}: {c:,}")
-
-    if summary["top_macs"]:
-        print("\n--- Top MAC Addresses ---")
-        for mac, c in summary["top_macs"].items():
-            print(f"  {mac}: {c:,}")
 
     if summary["root_bridge_changes"] > 0:
         print(f"\n[CRITICAL] Root Bridge Changes: {summary['root_bridge_changes']:,}")
@@ -566,40 +777,80 @@ def build_findings_markdown(summary):
     lines = ["## Key Findings & Recommended Actions\n"]
 
     # Root bridge instability
-    if summary["root_bridge_changes"] > 0:
+    if summary.get("root_bridge_changes", 0) > 0:
         lines.append("### CRITICAL: STP Root Bridge Instability")
         lines.append(f"- **{summary['root_bridge_changes']:,} Root Bridge Change events** detected")
-
-        # Top switches with STP events
         stp_switches = sorted(summary["switches"].items(), key=lambda x: -x[1]["stp"])
         for ip, info in stp_switches[:3]:
             if info["stp"] > 0:
                 lines.append(f"- {ip} ({info['hostname']}): **{info['stp']:,}** STP events")
-
-        # Top MAC address
-        if summary["top_macs"]:
+        if summary.get("top_macs"):
             top_mac, top_mac_count = next(iter(summary["top_macs"].items()))
             lines.append(f"- **MAC {top_mac}** in {top_mac_count:,} events - likely competing root")
-
         lines.append(f"- **{summary['num_vlans_affected']}+ VLANs** affected across fabric")
 
-    # Top STP event type
-    if summary["stp_types"]:
-        lines.append(f"\n### STP Event Breakdown")
-        for t, c in list(summary["stp_types"].items())[:5]:
-            lines.append(f"- {t}: **{c:,}** events")
+    # Interface instability
+    if summary.get("iface_down", 0) > 10:
+        lines.append(f"\n### WARNING: Interface Instability")
+        lines.append(f"- **{summary['iface_down']:,} link-down** events detected")
+        lines.append(f"- {summary.get('iface_up', 0):,} link-up events (flapping indicator)")
+        if summary.get("iface_admin_down", 0) > 0:
+            lines.append(f"- {summary['iface_admin_down']:,} admin-down events")
+
+    # CPU stress
+    if summary.get("cpu_high", 0) > 0:
+        lines.append(f"\n### WARNING: CPU High Utilization")
+        lines.append(f"- **{summary['cpu_high']:,} high-utilization alarms** raised")
+        lines.append(f"- {summary.get('cpu_low', 0):,} cleared — check if alarms are persistent")
+
+    # VLT issues
+    if summary.get("vlt_peer_down", 0) > 0:
+        lines.append(f"\n### WARNING: VLT Peer Instability")
+        lines.append(f"- **{summary['vlt_peer_down']:,} VLT peer-down** events")
+        lines.append(f"- {summary.get('vlt_channel_down', 0):,} VLT port-channel down events")
+        lines.append(f"- {summary.get('vlt_peer_up', 0):,} peer-up / {summary.get('vlt_channel_up', 0):,} channel-up recoveries")
+
+    # LACP churn
+    if summary.get("lacp_ungrouped", 0) > 10:
+        lines.append(f"\n### WARNING: LACP Port Churn")
+        lines.append(f"- **{summary['lacp_ungrouped']:,} port-ungrouped** events (ports leaving LAGs)")
+        lines.append(f"- {summary.get('lacp_grouped', 0):,} port-grouped events")
+
+    # Hardware
+    if summary.get("psu_faults", 0) > 0:
+        lines.append(f"\n### ALERT: Hardware Issues")
+        lines.append(f"- **{summary['psu_faults']:,} PSU fault(s)** detected")
+
+    # System
+    if summary.get("restarts", 0) > 0:
+        lines.append(f"\n### ALERT: System Restarts")
+        lines.append(f"- **{summary['restarts']:,} system restart/reload** events")
+
+    if summary.get("disk_warnings", 0) > 0:
+        lines.append(f"\n### WARNING: Low Disk Space")
+        lines.append(f"- **{summary['disk_warnings']:,}** low disk space warnings")
+
+    if summary.get("mac_moves", 0) > 5:
+        lines.append(f"\n### WARNING: MAC Address Flapping")
+        lines.append(f"- **{summary['mac_moves']:,} MAC move** events — potential loops or misconfigs")
 
     # Recommendations
     lines.append("\n### Recommended Actions")
-    lines.append("1. Verify STP root bridge priority on all switches")
-    if summary["top_macs"]:
-        top_mac = next(iter(summary["top_macs"]))
-        lines.append(f"2. Investigate MAC {top_mac} - identify the contesting device")
-    lines.append("3. Enable BPDU Guard on access ports")
-    if summary["top_interfaces"]:
+    if summary.get("root_bridge_changes", 0) > 0:
+        lines.append("1. Verify STP root bridge priority on all switches")
+        if summary.get("top_macs"):
+            top_mac = next(iter(summary["top_macs"]))
+            lines.append(f"2. Investigate MAC {top_mac} - identify the contesting device")
+    if summary.get("iface_down", 0) > 10:
+        lines.append("3. Check top flapping interfaces for cable/SFP issues")
+    if summary.get("cpu_high", 0) > 0:
+        lines.append("4. Review CPU utilization trends — consider control plane policing")
+    if summary.get("vlt_peer_down", 0) > 0:
+        lines.append("5. Review VLT heartbeat link and peer keepalive configuration")
+    lines.append("- Enable BPDU Guard on access ports")
+    if summary.get("top_interfaces"):
         top_iface = next(iter(summary["top_interfaces"]))
-        lines.append(f"4. Review interface {top_iface} ({summary['top_interfaces'][top_iface]:,} events)")
-    lines.append("5. Check port-channels for STP consistency")
+        lines.append(f"- Review interface {top_iface} ({summary['top_interfaces'][top_iface]:,} events)")
 
     return "\n".join(lines)
 
@@ -830,134 +1081,319 @@ def query_ingestion_timeframe(config, access_token):
 
 
 def build_dashboard(summary, time_from, time_to):
-    """Build Gen 3 dashboard JSON with dynamic content."""
+    """Build Gen 3 dashboard JSON with comprehensive analysis tiles."""
+    tile_counter = [0]
     def tid():
+        tile_counter[0] += 1
         return str(uuid.uuid4()).replace("-", "")[:12]
-
-    t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11 = [tid() for _ in range(11)]
 
     # Timeframe clause for all queries
     tf = f', from:"{time_from}", to:"{time_to}"'
+    src = 'log.source == "dell-switch"'
 
     # Dynamic header
     switch_list = ", ".join(
         f"{info['hostname'] or ip} ({info['model']})"
-        for ip, info in summary["switches"].items()
+        for ip, info in summary.get("switches", {}).items()
     )
+    cats = summary.get("categories", {})
+    cat_summary = " | ".join(f"**{k.title()}:** {v:,}" for k, v in list(cats.items())[:6])
     header = (
-        f"# Dell Switch STP Analysis Dashboard\n\n"
-        f"**Switches:** {switch_list} | "
+        f"# Dell Switch Comprehensive Analysis Dashboard\n\n"
+        f"**Switches:** {switch_list}\n\n"
         f"**Total Logs:** {summary['total_logs']:,} | "
-        f"**STP Events:** {summary['stp_count']:,} ({summary['stp_pct']:.1f}%)"
+        f"**STP Events:** {summary['stp_count']:,} ({summary['stp_pct']:.1f}%)\n\n"
+        f"{cat_summary}"
     )
 
-    # Dynamic findings
     findings = build_findings_markdown(summary)
+
+    tiles = {}
+    layout = []
+    y = 0  # Track vertical position
+
+    def add_tile(tile_def, w=24, h=6):
+        nonlocal y
+        t = tid()
+        tiles[t] = tile_def
+        layout.append({"w": w, "h": h, "x": 0 if w == 24 else layout[-1]["x"] + layout[-1]["w"] if layout and layout[-1]["y"] == y else 0, "y": y, "i": t})
+        return t
+
+    def add_row(tile_defs):
+        """Add tiles in a row, each gets equal width (24 total)."""
+        nonlocal y
+        w = 24 // len(tile_defs)
+        x = 0
+        h = tile_defs[0].get("_h", 5)
+        for td in tile_defs:
+            th = td.pop("_h", h)
+            t = tid()
+            tiles[t] = td
+            layout.append({"w": w, "h": th, "x": x, "y": y, "i": t})
+            x += w
+        y += h
+
+    def data_tile(title, query, viz, h=6):
+        return {
+            "type": "data", "title": title,
+            "query": query,
+            "visualization": viz,
+            "visualizationSettings": {"thresholds": []},
+            "davis": {"enabled": False, "davisVisualization": {"isAvailable": True}}
+        }
+
+    # ===================== HEADER =====================
+    t_hdr = tid()
+    tiles[t_hdr] = {"type": "markdown", "title": "", "content": header}
+    layout.append({"w": 24, "h": 3, "x": 0, "y": y, "i": t_hdr})
+    y += 3
+
+    # ===================== KPI ROW =====================
+    add_row([
+        {**data_tile("Total Logs",
+            f'fetch logs{tf}\n| filter {src}\n| summarize `Total` = count()',
+            "singleValue"), "_h": 4},
+        {**data_tile("STP Events",
+            f'fetch logs{tf}\n| filter {src}\n| filter stp.related == "true"\n| summarize `STP` = count()',
+            "singleValue"), "_h": 4},
+        {**data_tile("Interface Events",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "interface"\n| summarize `Interface` = count()',
+            "singleValue"), "_h": 4},
+        {**data_tile("Switches",
+            f'fetch logs{tf}\n| filter {src}\n| summarize `Switches` = countDistinct(switch.ip)',
+            "singleValue"), "_h": 4},
+    ])
+
+    # ===================== OVERVIEW SECTION =====================
+    t_sec1 = tid()
+    tiles[t_sec1] = {"type": "markdown", "title": "", "content": "## Overview"}
+    layout.append({"w": 24, "h": 1, "x": 0, "y": y, "i": t_sec1})
+    y += 1
+
+    # Event categories + severity distribution
+    t_cat = tid()
+    tiles[t_cat] = data_tile("Events by Category",
+        f'fetch logs{tf}\n| filter {src}\n| summarize `Events` = count(), by:{{`Category` = event.category}}\n| sort `Events`, direction:"descending"',
+        "pieChart")
+    layout.append({"w": 12, "h": 7, "x": 0, "y": y, "i": t_cat})
+
+    t_sev = tid()
+    tiles[t_sev] = data_tile("Events by Severity",
+        f'fetch logs{tf}\n| filter {src}\n| summarize `Events` = count(), by:{{`Severity` = severity}}\n| sort `Events`, direction:"descending"',
+        "categoricalBarChart")
+    layout.append({"w": 12, "h": 7, "x": 12, "y": y, "i": t_sev})
+    y += 7
+
+    # Events by switch
+    t_sw = tid()
+    tiles[t_sw] = data_tile("Events by Switch & Category",
+        f'fetch logs{tf}\n| filter {src}\n| summarize `Events` = count(), by:{{`Switch` = switch.ip, `Category` = event.category}}\n| sort `Events`, direction:"descending"',
+        "table")
+    layout.append({"w": 24, "h": 6, "x": 0, "y": y, "i": t_sw})
+    y += 6
+
+    # ===================== STP SECTION =====================
+    if summary.get("stp_count", 0) > 0:
+        t_sec2 = tid()
+        tiles[t_sec2] = {"type": "markdown", "title": "", "content": "## STP (Spanning Tree Protocol) Analysis"}
+        layout.append({"w": 24, "h": 1, "x": 0, "y": y, "i": t_sec2})
+        y += 1
+
+        t_stp_type = tid()
+        tiles[t_stp_type] = data_tile("STP Events by Type",
+            f'fetch logs{tf}\n| filter {src}\n| filter stp.related == "true"\n| summarize `Events` = count(), by:{{`STP Type` = stp.event.type}}\n| sort `Events`, direction:"descending"',
+            "pieChart")
+        layout.append({"w": 12, "h": 7, "x": 0, "y": y, "i": t_stp_type})
+
+        t_stp_sw = tid()
+        tiles[t_stp_sw] = data_tile("STP Events by Switch",
+            f'fetch logs{tf}\n| filter {src}\n| filter stp.related == "true"\n| summarize `Events` = count(), by:{{`Switch` = switch.ip}}\n| sort `Events`, direction:"descending"',
+            "categoricalBarChart")
+        layout.append({"w": 12, "h": 7, "x": 12, "y": y, "i": t_stp_sw})
+        y += 7
+
+        t_stp_vlan = tid()
+        tiles[t_stp_vlan] = data_tile("Top 15 Affected VLANs",
+            f'fetch logs{tf}\n| filter {src}\n| filter stp.related == "true"\n| filter isNotNull(vlan.id)\n| summarize `Events` = count(), by:{{`VLAN` = vlan.id}}\n| sort `Events`, direction:"descending"\n| limit 15',
+            "categoricalBarChart")
+        layout.append({"w": 12, "h": 7, "x": 0, "y": y, "i": t_stp_vlan})
+
+        t_stp_iface = tid()
+        tiles[t_stp_iface] = data_tile("Top STP Interfaces",
+            f'fetch logs{tf}\n| filter {src}\n| filter stp.related == "true"\n| filter isNotNull(interface.name)\n| summarize `Events` = count(), by:{{`Interface` = interface.name, `Switch` = switch.ip}}\n| sort `Events`, direction:"descending"\n| limit 15',
+            "table")
+        layout.append({"w": 12, "h": 7, "x": 12, "y": y, "i": t_stp_iface})
+        y += 7
+
+        t_stp_mac = tid()
+        tiles[t_stp_mac] = data_tile("MAC Addresses in STP Events",
+            f'fetch logs{tf}\n| filter {src}\n| filter stp.related == "true"\n| filter isNotNull(mac.address)\n| summarize `Events` = count(), by:{{`MAC` = mac.address}}\n| sort `Events`, direction:"descending"\n| limit 10',
+            "table")
+        layout.append({"w": 24, "h": 5, "x": 0, "y": y, "i": t_stp_mac})
+        y += 5
+
+    # ===================== INTERFACE SECTION =====================
+    iface_total = summary.get("iface_up", 0) + summary.get("iface_down", 0) + summary.get("iface_admin_up", 0) + summary.get("iface_admin_down", 0)
+    if iface_total > 0 or cats.get("interface", 0):
+        t_sec3 = tid()
+        tiles[t_sec3] = {"type": "markdown", "title": "", "content": "## Interface Health"}
+        layout.append({"w": 24, "h": 1, "x": 0, "y": y, "i": t_sec3})
+        y += 1
+
+        t_if_code = tid()
+        tiles[t_if_code] = data_tile("Interface Events by Type",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "interface"\n| summarize `Events` = count(), by:{{`Event` = event.code}}\n| sort `Events`, direction:"descending"',
+            "categoricalBarChart")
+        layout.append({"w": 12, "h": 7, "x": 0, "y": y, "i": t_if_code})
+
+        t_if_top = tid()
+        tiles[t_if_top] = data_tile("Top Interfaces by Event Count",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "interface"\n| filter isNotNull(interface.name)\n| summarize `Events` = count(), by:{{`Interface` = interface.name, `Switch` = switch.ip}}\n| sort `Events`, direction:"descending"\n| limit 15',
+            "table")
+        layout.append({"w": 12, "h": 7, "x": 12, "y": y, "i": t_if_top})
+        y += 7
+
+    # ===================== AUTH SECTION =====================
+    if summary.get("auth_events", 0) > 0 or cats.get("auth", 0):
+        t_sec4 = tid()
+        tiles[t_sec4] = {"type": "markdown", "title": "", "content": "## Authentication & Access"}
+        layout.append({"w": 24, "h": 1, "x": 0, "y": y, "i": t_sec4})
+        y += 1
+
+        t_auth = tid()
+        tiles[t_auth] = data_tile("Auth Events by Switch",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "auth"\n| summarize `Events` = count(), by:{{`Switch` = switch.ip}}\n| sort `Events`, direction:"descending"',
+            "categoricalBarChart")
+        layout.append({"w": 12, "h": 6, "x": 0, "y": y, "i": t_auth})
+
+        t_auth_log = tid()
+        tiles[t_auth_log] = data_tile("Recent Auth Events",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "auth"\n| sort timestamp, direction:"descending"\n| limit 50\n| fields timestamp, switch.ip, event.code, content',
+            "table")
+        layout.append({"w": 12, "h": 6, "x": 12, "y": y, "i": t_auth_log})
+        y += 6
+
+    # ===================== CPU / PERFORMANCE SECTION =====================
+    if summary.get("cpu_high", 0) > 0 or cats.get("performance", 0):
+        t_sec5 = tid()
+        tiles[t_sec5] = {"type": "markdown", "title": "", "content": "## CPU & Performance"}
+        layout.append({"w": 24, "h": 1, "x": 0, "y": y, "i": t_sec5})
+        y += 1
+
+        t_cpu = tid()
+        tiles[t_cpu] = data_tile("CPU Utilization Alarms",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "performance"\n| summarize `Events` = count(), by:{{`Alarm Type` = event.code}}\n| sort `Events`, direction:"descending"',
+            "categoricalBarChart")
+        layout.append({"w": 12, "h": 6, "x": 0, "y": y, "i": t_cpu})
+
+        t_cpu_sw = tid()
+        tiles[t_cpu_sw] = data_tile("CPU Alarms by Switch",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "performance"\n| summarize `Events` = count(), by:{{`Switch` = switch.ip, `Alarm` = event.code}}\n| sort `Events`, direction:"descending"',
+            "table")
+        layout.append({"w": 12, "h": 6, "x": 12, "y": y, "i": t_cpu_sw})
+        y += 6
+
+    # ===================== LACP SECTION =====================
+    if summary.get("lacp_grouped", 0) + summary.get("lacp_ungrouped", 0) > 0 or cats.get("lacp", 0):
+        t_sec6 = tid()
+        tiles[t_sec6] = {"type": "markdown", "title": "", "content": "## LACP / Link Aggregation"}
+        layout.append({"w": 24, "h": 1, "x": 0, "y": y, "i": t_sec6})
+        y += 1
+
+        t_lacp = tid()
+        tiles[t_lacp] = data_tile("LACP Events",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "lacp"\n| summarize `Events` = count(), by:{{`Event` = event.code}}\n| sort `Events`, direction:"descending"',
+            "categoricalBarChart")
+        layout.append({"w": 12, "h": 6, "x": 0, "y": y, "i": t_lacp})
+
+        t_lacp_det = tid()
+        tiles[t_lacp_det] = data_tile("LACP Events by Interface",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "lacp"\n| filter isNotNull(interface.name)\n| summarize `Events` = count(), by:{{`Interface` = interface.name, `Event` = event.code, `Switch` = switch.ip}}\n| sort `Events`, direction:"descending"\n| limit 20',
+            "table")
+        layout.append({"w": 12, "h": 6, "x": 12, "y": y, "i": t_lacp_det})
+        y += 6
+
+    # ===================== VLT SECTION =====================
+    if summary.get("vlt_peer_up", 0) + summary.get("vlt_peer_down", 0) > 0 or cats.get("vlt", 0):
+        t_sec7 = tid()
+        tiles[t_sec7] = {"type": "markdown", "title": "", "content": "## VLT (Virtual Link Trunking)"}
+        layout.append({"w": 24, "h": 1, "x": 0, "y": y, "i": t_sec7})
+        y += 1
+
+        t_vlt = tid()
+        tiles[t_vlt] = data_tile("VLT Events by Type",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "vlt"\n| summarize `Events` = count(), by:{{`Event` = event.code}}\n| sort `Events`, direction:"descending"',
+            "categoricalBarChart")
+        layout.append({"w": 12, "h": 6, "x": 0, "y": y, "i": t_vlt})
+
+        t_vlt_det = tid()
+        tiles[t_vlt_det] = data_tile("VLT Events by Switch",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "vlt"\n| summarize `Events` = count(), by:{{`Switch` = switch.ip, `Event` = event.code}}\n| sort `Events`, direction:"descending"',
+            "table")
+        layout.append({"w": 12, "h": 6, "x": 12, "y": y, "i": t_vlt_det})
+        y += 6
+
+    # ===================== HARDWARE SECTION =====================
+    if summary.get("psu_faults", 0) > 0 or cats.get("hardware", 0):
+        t_sec8 = tid()
+        tiles[t_sec8] = {"type": "markdown", "title": "", "content": "## Hardware Health"}
+        layout.append({"w": 24, "h": 1, "x": 0, "y": y, "i": t_sec8})
+        y += 1
+
+        t_hw = tid()
+        tiles[t_hw] = data_tile("Hardware Events",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "hardware"\n| summarize `Events` = count(), by:{{`Event` = event.code}}\n| sort `Events`, direction:"descending"',
+            "categoricalBarChart")
+        layout.append({"w": 12, "h": 6, "x": 0, "y": y, "i": t_hw})
+
+        t_hw_det = tid()
+        tiles[t_hw_det] = data_tile("Hardware Events by Switch",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "hardware"\n| summarize `Events` = count(), by:{{`Switch` = switch.ip, `Event` = event.code}}\n| sort `Events`, direction:"descending"',
+            "table")
+        layout.append({"w": 12, "h": 6, "x": 12, "y": y, "i": t_hw_det})
+        y += 6
+
+    # ===================== SYSTEM SECTION =====================
+    sys_events = summary.get("restarts", 0) + summary.get("disk_warnings", 0) + summary.get("mac_moves", 0)
+    if sys_events > 0 or cats.get("system", 0):
+        t_sec9 = tid()
+        tiles[t_sec9] = {"type": "markdown", "title": "", "content": "## System & Other Events"}
+        layout.append({"w": 24, "h": 1, "x": 0, "y": y, "i": t_sec9})
+        y += 1
+
+        t_sys = tid()
+        tiles[t_sys] = data_tile("System Events by Type",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "system"\n| summarize `Events` = count(), by:{{`Event` = event.code}}\n| sort `Events`, direction:"descending"',
+            "categoricalBarChart")
+        layout.append({"w": 12, "h": 6, "x": 0, "y": y, "i": t_sys})
+
+        t_sys_log = tid()
+        tiles[t_sys_log] = data_tile("Recent System Events",
+            f'fetch logs{tf}\n| filter {src}\n| filter event.category == "system"\n| sort timestamp, direction:"descending"\n| limit 50\n| fields timestamp, switch.ip, event.code, content',
+            "table")
+        layout.append({"w": 12, "h": 6, "x": 12, "y": y, "i": t_sys_log})
+        y += 6
+
+    # ===================== FINDINGS =====================
+    t_find = tid()
+    tiles[t_find] = {"type": "markdown", "title": "", "content": findings}
+    layout.append({"w": 24, "h": 12, "x": 0, "y": y, "i": t_find})
+    y += 12
+
+    # ===================== ALL LOGS TABLE =====================
+    t_all = tid()
+    tiles[t_all] = data_tile("All Log Entries",
+        f'fetch logs{tf}\n| filter {src}\n| sort timestamp, direction:"descending"\n| fields timestamp, switch.ip, severity, event.category, event.code, interface.name, vlan.id, content\n| limit 500',
+        "table")
+    layout.append({"w": 24, "h": 8, "x": 0, "y": y, "i": t_all})
 
     return {
         "version": 19,
         "variables": [],
         "settings": {},
         "importedWithCode": False,
-        "tiles": {
-            t1: {
-                "type": "markdown",
-                "title": "",
-                "content": header
-            },
-            t2: {
-                "type": "data",
-                "title": "Total STP Events",
-                "query": f"fetch logs{tf}\n| filter matchesPhrase(log.source, \"dell-switch\")\n| filter stp.related == \"true\"\n| summarize `STP Events` = count()",
-                "visualization": "singleValue",
-                "visualizationSettings": {"thresholds": []},
-                "davis": {"enabled": False, "davisVisualization": {"isAvailable": True}}
-            },
-            t3: {
-                "type": "data",
-                "title": "Total Logs Ingested",
-                "query": f"fetch logs{tf}\n| filter matchesPhrase(log.source, \"dell-switch\")\n| summarize `Total Logs` = count()",
-                "visualization": "singleValue",
-                "visualizationSettings": {"thresholds": []},
-                "davis": {"enabled": False, "davisVisualization": {"isAvailable": True}}
-            },
-            t4: {
-                "type": "data",
-                "title": "Switches Reporting STP",
-                "query": f"fetch logs{tf}\n| filter matchesPhrase(log.source, \"dell-switch\")\n| filter stp.related == \"true\"\n| summarize `Switches` = countDistinct(switch.ip)",
-                "visualization": "singleValue",
-                "visualizationSettings": {"thresholds": []},
-                "davis": {"enabled": False, "davisVisualization": {"isAvailable": True}}
-            },
-            t5: {
-                "type": "data",
-                "title": "STP Events by Type",
-                "query": f"fetch logs{tf}\n| filter matchesPhrase(log.source, \"dell-switch\")\n| filter stp.related == \"true\"\n| summarize `Events` = count(), by:{{`STP Event Type` = stp.event.type}}\n| sort `Events`, direction:\"descending\"",
-                "visualization": "pieChart",
-                "visualizationSettings": {"thresholds": []},
-                "davis": {"enabled": False, "davisVisualization": {"isAvailable": True}}
-            },
-            t6: {
-                "type": "data",
-                "title": "STP Events by Switch",
-                "query": f"fetch logs{tf}\n| filter matchesPhrase(log.source, \"dell-switch\")\n| filter stp.related == \"true\"\n| summarize `Events` = count(), by:{{`Switch` = switch.ip}}\n| sort `Events`, direction:\"descending\"",
-                "visualization": "categoricalBarChart",
-                "visualizationSettings": {"thresholds": []},
-                "davis": {"enabled": False, "davisVisualization": {"isAvailable": True}}
-            },
-            t7: {
-                "type": "data",
-                "title": "STP Events by Switch & Event Type",
-                "query": f"fetch logs{tf}\n| filter matchesPhrase(log.source, \"dell-switch\")\n| filter stp.related == \"true\"\n| summarize `Events` = count(), by:{{`Switch IP` = switch.ip, `Switch Model` = switch.model, `STP Event Type` = stp.event.type}}\n| sort `Events`, direction:\"descending\"",
-                "visualization": "table",
-                "visualizationSettings": {"thresholds": []},
-                "davis": {"enabled": False, "davisVisualization": {"isAvailable": True}}
-            },
-            t8: {
-                "type": "data",
-                "title": "Top 15 Affected VLANs",
-                "query": f"fetch logs{tf}\n| filter matchesPhrase(log.source, \"dell-switch\")\n| filter stp.related == \"true\"\n| filter isNotNull(stp.vlan.id)\n| summarize `Events` = count(), by:{{`VLAN ID` = stp.vlan.id}}\n| sort `Events`, direction:\"descending\"\n| limit 15",
-                "visualization": "categoricalBarChart",
-                "visualizationSettings": {"thresholds": []},
-                "davis": {"enabled": False, "davisVisualization": {"isAvailable": True}}
-            },
-            t9: {
-                "type": "data",
-                "title": "Top Affected Interfaces",
-                "query": f"fetch logs{tf}\n| filter matchesPhrase(log.source, \"dell-switch\")\n| filter stp.related == \"true\"\n| filter isNotNull(stp.interface)\n| summarize `Events` = count(), by:{{`Interface` = stp.interface, `Switch` = switch.ip}}\n| sort `Events`, direction:\"descending\"\n| limit 15",
-                "visualization": "table",
-                "visualizationSettings": {"thresholds": []},
-                "davis": {"enabled": False, "davisVisualization": {"isAvailable": True}}
-            },
-            t10: {
-                "type": "data",
-                "title": "MAC Addresses in STP Events",
-                "query": f"fetch logs{tf}\n| filter matchesPhrase(log.source, \"dell-switch\")\n| filter stp.related == \"true\"\n| filter isNotNull(stp.mac.address)\n| summarize `Events` = count(), by:{{`MAC Address` = stp.mac.address}}\n| sort `Events`, direction:\"descending\"\n| limit 10",
-                "visualization": "table",
-                "visualizationSettings": {"thresholds": []},
-                "davis": {"enabled": False, "davisVisualization": {"isAvailable": True}}
-            },
-            t11: {
-                "type": "markdown",
-                "title": "",
-                "content": findings
-            }
-        },
-        "layouts": {
-            "sm": [
-                {"w": 24, "h": 2, "x": 0, "y": 0, "i": t1},
-                {"w": 8, "h": 4, "x": 0, "y": 2, "i": t2},
-                {"w": 8, "h": 4, "x": 8, "y": 2, "i": t3},
-                {"w": 8, "h": 4, "x": 16, "y": 2, "i": t4},
-                {"w": 12, "h": 8, "x": 0, "y": 6, "i": t5},
-                {"w": 12, "h": 8, "x": 12, "y": 6, "i": t6},
-                {"w": 24, "h": 7, "x": 0, "y": 14, "i": t7},
-                {"w": 14, "h": 8, "x": 0, "y": 21, "i": t8},
-                {"w": 10, "h": 8, "x": 14, "y": 21, "i": t9},
-                {"w": 24, "h": 6, "x": 0, "y": 29, "i": t10},
-                {"w": 24, "h": 10, "x": 0, "y": 35, "i": t11}
-            ]
-        }
+        "tiles": tiles,
+        "layouts": {"sm": layout}
     }
 
 
@@ -969,7 +1405,7 @@ def create_dashboard(config, access_token, summary, time_from, time_to):
     doc_url = f"{config['env_url']}/platform/document/v1/documents"
     mp_headers = {"Authorization": f"Bearer {access_token}"}
     files = {"content": ("dashboard.json", content_str, "application/json")}
-    data = {"name": "Dell Switch STP Analysis", "type": "dashboard", "isPrivate": "true"}
+    data = {"name": "Dell Switch Comprehensive Analysis", "type": "dashboard", "isPrivate": "true"}
 
     print("\nCreating Gen 3 Dashboard...")
     resp = requests.post(doc_url, headers=mp_headers, files=files, data=data, timeout=30)
@@ -1137,6 +1573,15 @@ Examples:
                 "switches": {}, "stp_types": {},
                 "top_vlans": {}, "top_interfaces": {}, "top_macs": {},
                 "root_bridge_changes": 0, "num_vlans_affected": 0,
+                "categories": {}, "top_event_codes": {},
+                "iface_up": 0, "iface_down": 0,
+                "iface_admin_up": 0, "iface_admin_down": 0,
+                "cpu_high": 0, "cpu_low": 0,
+                "lacp_grouped": 0, "lacp_ungrouped": 0,
+                "vlt_peer_up": 0, "vlt_peer_down": 0,
+                "vlt_channel_up": 0, "vlt_channel_down": 0,
+                "psu_faults": 0, "restarts": 0,
+                "disk_warnings": 0, "mac_moves": 0, "auth_events": 0,
             }
 
         create_dashboard(config, access_token, summary, time_from, time_to)

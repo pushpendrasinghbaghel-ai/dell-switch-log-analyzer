@@ -1,13 +1,14 @@
 # Dell Switch Log Analyzer for Dynatrace
 
-A CLI tool that parses Dell switch syslog files, ingests them into Dynatrace Grail, analyzes STP (Spanning Tree Protocol) issues, and auto-generates a Gen 3 dashboard — all in a single command.
+A CLI tool that parses Dell switch syslog files, ingests them into Dynatrace Grail, performs comprehensive analysis, and auto-generates a Gen 3 dashboard — all in a single command.
 
 ## What It Does
 
 1. **Parses** Dell switch syslog files (BSD and RFC5424 formats)
-2. **Ingests** parsed log entries into Dynatrace via the Log Ingest API
-3. **Analyzes** STP-related events: root bridge changes, topology changes, BPDU events, port state transitions
-4. **Creates** a Dynatrace Gen 3 dashboard with interactive charts and findings
+2. **Classifies** every event into categories: STP, Interface, Auth, CPU, LACP, VLT, Hardware, System
+3. **Ingests** parsed log entries into Dynatrace via the Log Ingest API
+4. **Analyzes** across all categories with key findings and recommendations
+5. **Creates** a Dynatrace Gen 3 dashboard with 30+ interactive tiles
 
 ## Supported Switch Models
 
@@ -109,33 +110,81 @@ Each log entry is sent to Dynatrace with these attributes:
 | `switch.ip` | Switch IP (from filename) |
 | `switch.hostname` | Switch hostname (from log content) |
 | `switch.model` | Detected model (N3048ET, S4128T-ON, etc.) |
-| `syslog.severity` | Syslog severity level |
-| `syslog.facility` | Syslog facility name |
-| `dell.event.type` | Application/process that generated the log |
+| `severity` | Syslog severity level |
+| `event.category` | Event category: `stp`, `interface`, `auth`, `performance`, `lacp`, `vlt`, `hardware`, `system` |
+| `event.code` | Specific event code (e.g. `STP_ROOT_CHANGE`, `IFM_OSTATE_DN`, `PM_SYS_UTIL_HI`) |
 | `stp.related` | `true` / `false` |
-| `stp.event.type` | STP event classification (root_bridge_change, topology_change, etc.) |
-| `stp.vlan` | VLAN ID (if present) |
-| `stp.interface` | Interface name (if present) |
-| `stp.mac` | MAC address (if present) |
+| `stp.event.type` | STP event classification (if STP-related) |
+| `vlan.id` | VLAN ID (if present) |
+| `interface.name` | Interface name (if present) |
+| `mac.address` | MAC address (if present) |
+| `dell.event.type` | OS10 application name |
+
+## Event Categories
+
+| Category | Events Detected |
+|----------|----------------|
+| **STP** | Root bridge changes, topology changes, port state transitions, BPDU, compatibility mode |
+| **Interface** | Link up/down, admin state changes, interface flapping |
+| **Auth** | User logins, session starts, password changes |
+| **Performance** | CPU high/low utilization alarms, process utilization |
+| **LACP** | Port grouped/ungrouped, LAG membership changes |
+| **VLT** | Peer up/down, port-channel state, role elections, delay restore |
+| **Hardware** | Fan tray, PSU detection/faults, unit detection, SFP changes |
+| **System** | Restarts, reloads, low disk space, MAC moves, SupportAssist, mode changes |
 
 ## Dashboard
 
-The generated Gen 3 dashboard includes:
+The generated Gen 3 dashboard has 30+ tiles organized into sections:
 
-- **Header** — switches analyzed, total logs, STP event count
-- **Key findings** — dynamic markdown summarizing root bridge instability, affected VLANs, top interfaces
-- **STP Event Count** — single-value tile
+### Overview
+- **KPI Row** — Total Logs, STP Events, Interface Events, Switch Count
+- **Events by Category** — pie chart breakdown
 - **Events by Severity** — bar chart
-- **Events Over Time** — time series
-- **STP Event Type Distribution** — pie chart
-- **Top Affected VLANs** — bar chart
-- **Top Affected Interfaces** — bar chart
-- **Root Bridge Changes Over Time** — time series
-- **STP Events by Switch** — bar chart
-- **Recent Critical STP Events** — log table
-- **All Log Entries** — full log table
+- **Events by Switch & Category** — detail table
 
-> **Note**: The dashboard uses absolute timestamps matching the ingestion time window, so data always shows regardless of the dashboard time picker.
+### STP Analysis
+- STP Events by Type (pie chart)
+- STP Events by Switch (bar chart)
+- Top 15 Affected VLANs
+- Top STP Interfaces
+- MAC Addresses in STP Events
+
+### Interface Health
+- Interface Events by Type (up/down/admin)
+- Top Interfaces by Event Count
+
+### Authentication & Access
+- Auth Events by Switch
+- Recent Auth Events log
+
+### CPU & Performance
+- CPU Utilization Alarms (high vs cleared)
+- CPU Alarms by Switch
+
+### LACP / Link Aggregation
+- LACP Events (grouped vs ungrouped)
+- LACP Events by Interface
+
+### VLT (Virtual Link Trunking)
+- VLT Events by Type
+- VLT Events by Switch
+
+### Hardware Health
+- Hardware Events (fan, PSU, unit, SFP)
+- Hardware Events by Switch
+
+### System Events
+- System Events by Type (restarts, disk, MAC moves)
+- Recent System Events
+
+### Key Findings
+- Dynamic markdown with CRITICAL/WARNING findings and recommended actions
+
+### All Logs
+- Full searchable log table (500 most recent)
+
+> **Note**: Sections only appear if relevant events exist in the data. The dashboard uses absolute timestamps matching the ingestion time window.
 
 ## Architecture
 
@@ -143,18 +192,23 @@ The generated Gen 3 dashboard includes:
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
 │  Dell Switch     │     │  Log Parser      │     │  Dynatrace          │
 │  Syslog Files    │────▶│  (BSD / RFC5424) │────▶│  Log Ingest API     │
-│  (.txt / .log)   │     │  + STP Analysis  │     │  (Grail Storage)    │
+│  (.txt / .log)   │     │  + Classifier    │     │  (Grail Storage)    │
 └─────────────────┘     └──────────────────┘     └─────────┬───────────┘
-                                                           │
-                         ┌──────────────────┐              │
+                              │                            │
+                              │ 8 Event Categories:       │
+                              │ STP, Interface, Auth,     │
+                              │ CPU, LACP, VLT,           │
+                              │ Hardware, System           │
+                              │                            │
+                         ┌────▼─────────────┐              │
                          │  OAuth PKCE Flow │◀─────────────┘
                          │  (Browser Auth)  │
                          └────────┬─────────┘
                                   │
                          ┌────────▼─────────┐
                          │  Document API    │
-                         │  (Gen 3 Dashboard│
-                         │   Creation)      │
+                         │  Gen 3 Dashboard │
+                         │  (30+ tiles)     │
                          └──────────────────┘
 ```
 
