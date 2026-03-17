@@ -1,0 +1,38 @@
+# Log data
+*.txt
+*.log
+*.zip
+
+# Parsed/analysis output
+parsed_logs.json
+stp_events.json
+analysis_summary.json
+
+# Downloaded dashboards
+dashboard_*.json
+stp_*.json
+
+# Helper/scratch scripts (not part of the tool)
+create_dashboard.py
+create_gen3_dashboard.py
+create_gen3_dashboard_oauth.py
+fetch_dashboards.py
+fix_dashboard.py
+fix_davis.py
+ingest_dell_switch_logs.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
